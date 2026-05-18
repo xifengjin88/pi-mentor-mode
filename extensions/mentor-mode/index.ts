@@ -3,12 +3,14 @@ import { truncateHead } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 type Mode = "learn" | "search" | "index" | "unstuck" | "do";
 
 interface MentorState {
+  enabled: boolean;
   mode: Mode;
   lastIndexedAt: string | undefined;
   fileHashes: Record<string, string>;
@@ -38,14 +40,30 @@ async function safeRead(p: string) {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const SEARCH_SCRIPT = path.resolve(__dirname, "../../scripts/search.sh");
+const GLOBAL_WIKI_ROOT = path.join(os.homedir(), ".pi", "wiki");
+
+async function resolveProjectName(cwd: string, pi: ExtensionAPI): Promise<string> {
+  const gitRoot = await pi.exec("git", ["rev-parse", "--show-toplevel"], { cwd });
+  const root = (gitRoot.stdout || "").trim();
+  if (gitRoot.code === 0 && root) return path.basename(root);
+  return path.basename(cwd);
+}
 
 export default function mentorMode(pi: ExtensionAPI) {
-  const state: MentorState = { mode: "learn", lastIndexedAt: undefined, fileHashes: {} };
+  const state: MentorState = { enabled: true, mode: "learn", lastIndexedAt: undefined, fileHashes: {} };
+
+  const persist = () => pi.appendEntry(STATE_TYPE, { ...state });
+
+  const clearUi = (ctx: ExtensionContext) => {
+    if (!ctx.hasUI) return;
+    ctx.ui.setStatus("mentor-mode", "");
+    ctx.ui.setWidget("mentor-mode", []);
+  };
 
   const setMode = (mode: Mode, ctx?: ExtensionContext) => {
     state.mode = mode;
-    pi.appendEntry(STATE_TYPE, { ...state });
-    if (ctx?.hasUI) {
+    persist();
+    if (ctx?.hasUI && state.enabled) {
       ctx.ui.setStatus("mentor-mode", `${MODE_TEXT[mode].icon} ${mode}`);
       ctx.ui.setWidget("mentor-mode", ["mentor-mode", MODE_TEXT[mode].desc]);
       ctx.ui.notify(`mentor-mode: switched to ${mode}`, "info");
@@ -53,6 +71,7 @@ export default function mentorMode(pi: ExtensionAPI) {
   };
 
   const applyUi = (ctx: ExtensionContext) => {
+    if (!state.enabled) return clearUi(ctx);
     if (!ctx.hasUI) return;
     ctx.ui.setStatus("mentor-mode", `${MODE_TEXT[state.mode].icon} ${state.mode}`);
     ctx.ui.setWidget("mentor-mode", ["mentor-mode", MODE_TEXT[state.mode].desc]);
@@ -62,6 +81,7 @@ export default function mentorMode(pi: ExtensionAPI) {
     for (const entry of ctx.sessionManager.getEntries()) {
       if (entry.type === "custom" && entry.customType === STATE_TYPE && entry.data) {
         const data = entry.data as Partial<MentorState>;
+        state.enabled = data.enabled ?? state.enabled;
         state.mode = (data.mode as Mode) || state.mode;
         state.lastIndexedAt = data.lastIndexedAt;
         state.fileHashes = data.fileHashes || state.fileHashes;
@@ -71,11 +91,15 @@ export default function mentorMode(pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", async (event) => {
+    if (!state.enabled) return;
+
     const modeRules = `
 
 [mentor-mode]
 Current mode: ${state.mode}
 Slash commands:
+- /mentor on
+- /mentor off
 - /mentor learn
 - /mentor search <query>
 - /mentor index
@@ -85,7 +109,7 @@ Slash commands:
 Operating modes:
 1) learn (default): guide step-by-step. Do not write large code blocks. Explain each piece, ask user to implement, then verify before proceeding.
 2) search: use web_search for relevant docs/examples, summarize results, and tie them to the task.
-3) index: use project_index to build or refresh .pi/wiki.
+3) index: use project_index to build or refresh ~/.pi/wiki/<project-name>/.
 4) unstuck: diagnose errors and blockers, read relevant files, give targeted hints first.
 5) do: directly implement changes (write/edit/run tests freely).
 
@@ -117,12 +141,13 @@ Behavior policy:
   pi.registerTool({
     name: "project_index",
     label: "Project Index",
-    description: "Build or update a wiki-style index under .pi/wiki using project structure and code relationships.",
-    promptSnippet: "Build/update .pi/wiki index pages from project files.",
-    promptGuidelines: ["Use project_index to build or refresh the project knowledge base in .pi/wiki."],
+    description: "Build or update a wiki-style index under ~/.pi/wiki/<project-name>/ using project structure and code relationships.",
+    promptSnippet: "Build/update ~/.pi/wiki index pages from project files.",
+    promptGuidelines: ["Use project_index to build or refresh the project knowledge base in ~/.pi/wiki."],
     parameters: Type.Object({ force: Type.Optional(Type.Boolean({ description: "Re-index all files" })) }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const wikiRoot = path.join(ctx.cwd, ".pi", "wiki");
+      const projectName = await resolveProjectName(ctx.cwd, pi);
+      const wikiRoot = path.join(GLOBAL_WIKI_ROOT, projectName);
       await mkdir(path.join(wikiRoot, "modules"), { recursive: true });
       await mkdir(path.join(wikiRoot, "concepts"), { recursive: true });
       await mkdir(path.join(wikiRoot, "decisions"), { recursive: true });
@@ -143,7 +168,7 @@ Behavior policy:
       }
 
       const now = new Date().toISOString();
-      const indexLines: string[] = ["# Project Wiki Index", "", "Generated pages:", ""];
+      const indexLines: string[] = ["# Project Wiki Index", "", `Project: ${projectName}`, "", "Generated pages:", ""];
       const overview: string[] = ["# Project Overview", "", `Last indexed: ${now}`, "", "## Key Areas", ""];
 
       for (const rel of changed) {
@@ -174,28 +199,56 @@ Behavior policy:
       await writeFile(path.join(wikiRoot, "index.md"), indexLines.join("\n") + "\n", "utf8");
       await writeFile(path.join(wikiRoot, "overview.md"), overview.join("\n") + "\n", "utf8");
 
-      const logPath = path.join(wikiRoot, "log.md");
-      const priorLog = await safeRead(logPath);
-      const logEntry = `\n## [${now}] index\n- changed_files: ${changed.length}\n- total_tracked_files: ${Object.keys(state.fileHashes).length}\n`;
-      await writeFile(logPath, `${priorLog}${logEntry}`, "utf8");
+      const projectLogPath = path.join(wikiRoot, "log.md");
+      const projectPriorLog = await safeRead(projectLogPath);
+      const projectLogEntry = `\n## [${now}] index\n- changed_files: ${changed.length}\n- total_tracked_files: ${Object.keys(state.fileHashes).length}\n`;
+      await writeFile(projectLogPath, `${projectPriorLog}${projectLogEntry}`, "utf8");
+
+      await mkdir(GLOBAL_WIKI_ROOT, { recursive: true });
+      const globalIndexPath = path.join(GLOBAL_WIKI_ROOT, "index.md");
+      const globalLogPath = path.join(GLOBAL_WIKI_ROOT, "log.md");
+
+      const globalIndex = await safeRead(globalIndexPath);
+      const globalIndexLines = globalIndex ? globalIndex.split("\n") : ["# Global Wiki Index", ""];
+      const projectLine = `- [[${projectName}/index]] | last indexed ${now}`;
+      const filtered = globalIndexLines.filter((line) => !line.startsWith(`- [[${projectName}/index]] |`));
+      filtered.push(projectLine);
+      await writeFile(globalIndexPath, `${filtered.join("\n").trimEnd()}\n`, "utf8");
+
+      const globalPriorLog = await safeRead(globalLogPath);
+      await writeFile(globalLogPath, `${globalPriorLog}\n## [${now}] indexed project\n- project: ${projectName}\n- path: ${wikiRoot}\n`, "utf8");
 
       state.lastIndexedAt = now;
-      pi.appendEntry(STATE_TYPE, { ...state });
+      persist();
 
       return {
-        content: [{ type: "text", text: `Indexed ${changed.length} changed files. Wiki updated at .pi/wiki/.` }],
-        details: { changedCount: changed.length, lastIndexedAt: now },
+        content: [{ type: "text", text: `Indexed ${changed.length} changed files. Wiki updated at ${wikiRoot}.` }],
+        details: { changedCount: changed.length, lastIndexedAt: now, projectName, wikiRoot },
       };
     },
   });
 
   pi.registerCommand("mentor", {
-    description: "mentor-mode controls: learn | search <query> | index | unstuck | do <description>",
+    description: "mentor-mode controls: on | off | learn | search <query> | index | unstuck | do <description>",
     handler: async (args, ctx) => {
       const input = (args || "").trim();
       const [sub, ...rest] = input.split(/\s+/);
       const tail = rest.join(" ").trim();
 
+      if (sub === "off") {
+        state.enabled = false;
+        persist();
+        clearUi(ctx);
+        ctx.ui.notify("mentor-mode: disabled", "info");
+        return;
+      }
+      if (sub === "on") {
+        state.enabled = true;
+        persist();
+        applyUi(ctx);
+        ctx.ui.notify(`mentor-mode: enabled (${state.mode})`, "info");
+        return;
+      }
       if (!sub || sub === "learn") {
         setMode("learn", ctx);
         return;
@@ -209,7 +262,7 @@ Behavior policy:
       }
       if (sub === "index") {
         setMode("index", ctx);
-        pi.sendUserMessage("Use project_index to refresh .pi/wiki now.");
+        pi.sendUserMessage("Use project_index to refresh ~/.pi/wiki now.");
         return;
       }
       if (sub === "unstuck") {
@@ -222,28 +275,35 @@ Behavior policy:
         return;
       }
 
-      ctx.ui.notify("Usage: /mentor learn|search <query>|index|unstuck|do <description>", "warning");
+      ctx.ui.notify("Usage: /mentor on|off|learn|search <query>|index|unstuck|do <description>", "warning");
     },
   });
 
   pi.registerCommand("wiki", {
-    description: "Open/query wiki. Use: /wiki or /wiki search <term>",
+    description: "Open/query wiki. Use: /wiki [--all] or /wiki search <term> [--all]",
     handler: async (args, ctx) => {
       const input = (args || "").trim();
-      if (!input) {
-        const idx = await safeRead(path.join(ctx.cwd, ".pi", "wiki", "index.md"));
-        ctx.ui.notify(idx ? "Loaded .pi/wiki/index.md (use read tool for full content)." : "No wiki index yet. Run /mentor index.", "info");
+      const tokens = input ? input.split(/\s+/) : [];
+      const useAll = tokens.includes("--all");
+      const projectName = await resolveProjectName(ctx.cwd, pi);
+      const projectWikiRoot = path.join(GLOBAL_WIKI_ROOT, projectName);
+
+      if (!input || input === "--all") {
+        const idxPath = useAll ? path.join(GLOBAL_WIKI_ROOT, "index.md") : path.join(projectWikiRoot, "index.md");
+        const idx = await safeRead(idxPath);
+        ctx.ui.notify(idx ? `Loaded ${idxPath} (use read tool for full content).` : "No wiki index yet. Run /mentor index.", "info");
         return;
       }
 
-      const [sub, ...rest] = input.split(/\s+/);
+      const [sub, ...rest] = tokens.filter((t) => t !== "--all");
       if (sub === "search") {
         const term = rest.join(" ").trim();
         if (!term) {
           ctx.ui.notify("Usage: /wiki search <term>", "warning");
           return;
         }
-        const grep = await pi.exec("grep", ["-R", "-n", term, ".pi/wiki"]);
+        const grepRoot = useAll ? GLOBAL_WIKI_ROOT : projectWikiRoot;
+        const grep = await pi.exec("grep", ["-R", "-n", term, grepRoot]);
         ctx.ui.notify("Wiki search complete (see output in tool context).", "info");
         pi.sendMessage({ customType: "mentor-wiki-search", content: grep.stdout || grep.stderr || "No matches", display: true });
         return;
